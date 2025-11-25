@@ -1,19 +1,24 @@
-import { Controller, Get, Post, Body, Patch, Param, Delete } from '@nestjs/common';
+import { Controller, Get, Post, Body, Patch, Param, Delete, UseInterceptors, UploadedFile, BadRequestException } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 import { DetectionService } from './detection.service';
-import { CreateDetectionDto } from './dto/create-detection.dto';
 import { UpdateDetectionDto } from './dto/update-detection.dto';
+import { DetectionResponseDto } from './dto/detection-response.dto';
 
 @Controller('detection')
 export class DetectionController {
   constructor(private readonly detectionService: DetectionService) {}
 
   @Post()
-  create(@Body() createDetectionDto: CreateDetectionDto) {
-    return this.detectionService.create(createDetectionDto);
+  @UseInterceptors(FileInterceptor('file'))
+  async create(@UploadedFile() file: Express.Multer.File): Promise<DetectionResponseDto> {
+    if (!file) {
+      throw new BadRequestException('파일이 업로드되지 않았습니다.');
+    }
+    return this.detectionService.detectAndSave(file);
   }
 
   @Get()
-  findAll() {
+  findAll(): Promise<DetectionResponseDto[]> {
     return this.detectionService.findAll();
   }
 

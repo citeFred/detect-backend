@@ -1,44 +1,82 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
-import { CreateDetectionDto } from './dto/create-detection.dto';
-import { UpdateDetectionDto } from './dto/update-detection.dto';
+import { Injectable, NotFoundException, InternalServerErrorException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Detection } from './entities/detection.entity';
+import { HttpService } from '@nestjs/axios';
+import { lastValueFrom } from 'rxjs';
+import FormData from 'form-data';
+import { UpdateDetectionDto } from './dto/update-detection.dto';
+import { DetectionResponseDto } from './dto/detection-response.dto';
+import { InferenceResponseDto } from './dto/inference-response.dto';
 
 @Injectable()
 export class DetectionService {
-  // DI
   constructor(
     @InjectRepository(Detection)
     private detectionRepository: Repository<Detection>,
+    private readonly httpService: HttpService,
   ) {}
 
-  // Create
-  async create(createDetectionDto: CreateDetectionDto): Promise<Detection> {
-    // 1. DTO로부터 Entity 인스턴스 생성
-    const newDetection = this.detectionRepository.create(createDetectionDto);
-    
-    // 2. DB에 저장 (INSERT 쿼리가 실행됨)
-    return this.detectionRepository.save(newDetection);
-  }
+  // 탐지(파일 업로드 -> FastAPI 추론 -> 결과 DB 저장)
+  async detectAndSave(file: Express.Multer.File): Promise<DetectionResponseDto> {    
+    let inferenceServerApiUrl = '';
+    let apiResult: InferenceResponseDto | null = null;
+    const mimeType = file.mimetype;
 
-  // Find All
-  async findAll(): Promise<Detection[]> {
-    // 1. DB에서 'detection' 테이블의 모든 데이터를 조회 (SELECT * 쿼리)
-    return this.detectionRepository.find();
-  }
-
-  // Find One
-  async findOne(id: number): Promise<Detection> {
-    // 1. DB에서 'id' 컬럼을 기준으로 1개 조회 (SELECT * ... WHERE id = ...)
-    const detection = await this.detectionRepository.findOneBy({ id });
-
-    // 2. (에러 핸들링) 만약 해당 ID의 데이터가 없으면 404 에러 반환
-    if (!detection) {
-      throw new NotFoundException(`ID #${id}에 해당하는 탐지 내역을 찾을 수 없습니다.`);
+    // 1. 파일 타입에 따라 FastAPI 엔드포인트 결정
+    if (mimeType.startsWith('image/')) {
+      inferenceServerApiUrl = 'http://localhost:8000/predict/image';
+    } else if (mimeType.startsWith('audio/') || mimeType === 'application/octet-stream') {
+      inferenceServerApiUrl = 'http://localhost:8000/predict/audio';
+    } else {
+      throw new Error('지원하지 않는 파일 형식입니다. (이미지 또는 오디오만 가능)');
     }
 
-    // 3. 찾은 데이터 반환
+    // 2. FastAPI로 보낼 FormData 생성
+    const formData = new FormData();
+    formData.append('file', file.buffer, file.originalname);
+
+    try {
+      // 3. Inference API 서버 호출(Axios 사용)
+      const response = await lastValueFrom(
+        this.httpService.post<InferenceResponseDto>(
+          inferenceServerApiUrl,
+          formData, 
+          {
+            headers: formData.getHeaders(),
+          }
+        ),
+      );
+      apiResult = response.data;
+    } catch (error) {
+        console.error('FastAPI Connection Error:', error.message);
+      throw new InternalServerErrorException('AI 서버와 통신 중 오류가 발생했습니다.');
+    }
+
+    // 4. DB에 저장할 엔티티 생성(DTO-Entity 매핑)
+    const newDetection = this.detectionRepository.create({
+      filename: file.originalname,
+      filetype: file.mimetype,
+      isDeepfake: apiResult.is_deepfake ?? false,
+      confidence: Number(apiResult?.confidence ?? 0.0)
+    });
+
+    // 5. DB 저장 및 결과 DTO 반환
+    const savedEntity = await this.detectionRepository.save(newDetection);
+    const detectionResponseDto = Object.assign(new DetectionResponseDto(), savedEntity);
+    return detectionResponseDto;
+  }
+
+  async findAll(): Promise<DetectionResponseDto[]> {
+    const detectionResponseDtos = await this.detectionRepository.find({ order: { createdAt: 'DESC' } });
+    return detectionResponseDtos.map(detection => Object.assign(new DetectionResponseDto(), detection));
+  }
+
+  async findOne(id: number): Promise<Detection> {
+    const detection = await this.detectionRepository.findOneBy({ id });
+    if (!detection) {
+      throw new NotFoundException(`ID #${id} Not Found`);
+    }
     return detection;
   }
 
